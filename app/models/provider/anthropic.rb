@@ -1,5 +1,6 @@
 class Provider::Anthropic < Provider
   include LlmConcept
+  include LangfuseTraceable
 
   # Subclass so errors caught in this provider are raised as Provider::Anthropic::Error
   Error = Class.new(Provider::Error)
@@ -68,7 +69,6 @@ class Provider::Anthropic < Provider
 
   def auto_categorize(transactions: [], user_categories: [], model: "", family: nil, json_mode: nil)
     with_provider_response do
-      raise Error, "Too many transactions to auto-categorize. Max is 25 per request." if transactions.size > 25
       if user_categories.blank?
         family_id = family&.id || "unknown"
         Rails.logger.error("Cannot auto-categorize transactions for family #{family_id}: no categories available")
@@ -91,9 +91,12 @@ class Provider::Anthropic < Provider
         family: family
       ).auto_categorize
 
-      upsert_langfuse_trace(trace: trace, output: result.map(&:to_h))
+      finish_langfuse_trace(trace: trace, output: result.map(&:to_h))
 
       result
+    rescue => error
+      finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+      raise
     end
   end
 
@@ -116,16 +119,17 @@ class Provider::Anthropic < Provider
         family: family
       ).suggest
 
-      upsert_langfuse_trace(trace: trace, output: result.to_h)
+      finish_langfuse_trace(trace: trace, output: result.to_h)
 
       result
+    rescue => error
+      finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+      raise
     end
   end
 
   def auto_detect_merchants(transactions: [], user_merchants: [], model: "", family: nil, json_mode: nil)
     with_provider_response do
-      raise Error, "Too many transactions to auto-detect merchants. Max is 25 per request." if transactions.size > 25
-
       effective_model = model.presence || @default_model
 
       trace = create_langfuse_trace(
@@ -142,16 +146,17 @@ class Provider::Anthropic < Provider
         family: family
       ).auto_detect_merchants
 
-      upsert_langfuse_trace(trace: trace, output: result.map(&:to_h))
+      finish_langfuse_trace(trace: trace, output: result.map(&:to_h))
 
       result
+    rescue => error
+      finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+      raise
     end
   end
 
   def enhance_provider_merchants(merchants: [], model: "", family: nil, json_mode: nil)
     with_provider_response do
-      raise Error, "Too many merchants to enhance. Max is 25 per request." if merchants.size > 25
-
       effective_model = model.presence || @default_model
 
       trace = create_langfuse_trace(
@@ -167,9 +172,12 @@ class Provider::Anthropic < Provider
         family: family
       ).enhance_merchants
 
-      upsert_langfuse_trace(trace: trace, output: result.map(&:to_h))
+      finish_langfuse_trace(trace: trace, output: result.map(&:to_h))
 
       result
+    rescue => error
+      finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+      raise
     end
   end
 
@@ -197,9 +205,12 @@ class Provider::Anthropic < Provider
         family: family
       ).process
 
-      upsert_langfuse_trace(trace: trace, output: result.to_h)
+      finish_langfuse_trace(trace: trace, output: result.to_h)
 
       result
+    rescue => error
+      finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+      raise
     end
   end
 
@@ -220,9 +231,12 @@ class Provider::Anthropic < Provider
         family: family
       ).extract
 
-      upsert_langfuse_trace(trace: trace, output: { transaction_count: result[:transactions].size })
+      finish_langfuse_trace(trace: trace, output: { transaction_count: result[:transactions].size })
 
       result
+    rescue => error
+      finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+      raise
     end
   end
 
@@ -384,37 +398,14 @@ class Provider::Anthropic < Provider
       hash
     end
 
-    def langfuse_client
-      return unless ENV["LANGFUSE_PUBLIC_KEY"].present? && ENV["LANGFUSE_SECRET_KEY"].present?
-
-      @langfuse_client ||= Langfuse.new
-    end
-
-    def create_langfuse_trace(name:, input:, session_id: nil, user_identifier: nil)
-      return unless langfuse_client
-
-      langfuse_client.trace(
-        name: name,
-        input: input,
-        session_id: session_id,
-        user_id: user_identifier,
-        environment: Rails.env
-      )
-    rescue => e
-      # Sanitized log (class + message only) — `e.full_message` bundles the
-      # backtrace + cause chain, which on some SDK error types includes the
-      # serialized request/response payload (model output, user prompt).
-      Rails.logger.warn("Langfuse trace creation failed: #{e.class}: #{e.message}")
-      nil
-    end
-
     def log_langfuse_generation(name:, model:, input:, trace:, output: nil, usage: nil, error: nil)
       return unless langfuse_client
 
       generation = trace&.generation(
         name: name,
         model: model,
-        input: input
+        input: input,
+        start_time: trace.start_time
       )
 
       if error
@@ -422,25 +413,13 @@ class Provider::Anthropic < Provider
           output: { error: error.message, details: error.respond_to?(:details) ? error.details : nil },
           level: "ERROR"
         )
-        upsert_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
+        finish_langfuse_trace(trace: trace, output: { error: error.message }, level: "ERROR")
       else
         generation&.end(output: output, usage: usage)
-        upsert_langfuse_trace(trace: trace, output: output)
+        finish_langfuse_trace(trace: trace, output: output)
       end
     rescue => e
       Rails.logger.warn("Langfuse logging failed: #{e.class}: #{e.message}")
-    end
-
-    def upsert_langfuse_trace(trace:, output:, level: nil)
-      return unless langfuse_client && trace&.id
-
-      payload = { id: trace.id, output: output }
-      payload[:level] = level if level.present?
-
-      langfuse_client.trace(**payload)
-    rescue => e
-      Rails.logger.warn("Langfuse trace upsert failed for trace_id=#{trace&.id}: #{e.class}: #{e.message}")
-      nil
     end
 
     def record_llm_usage(family:, model:, operation:, usage: nil, error: nil)
